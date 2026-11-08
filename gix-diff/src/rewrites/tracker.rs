@@ -1029,8 +1029,8 @@ struct Candidate {
     eligible: bool,
 }
 
-fn candidate_rank(candidate: Option<Candidate>) -> Option<(u16, bool)> {
-    candidate.map(|candidate| (candidate.score, candidate.name_score))
+fn candidate_rank(candidate: Option<Candidate>) -> Option<(bool, u16, bool)> {
+    candidate.map(|candidate| (candidate.eligible, candidate.score, candidate.name_score))
 }
 
 #[cfg(test)]

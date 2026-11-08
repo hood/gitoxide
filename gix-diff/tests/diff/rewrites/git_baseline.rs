@@ -380,7 +380,7 @@ fn stricter_copy_threshold_does_not_crowd_out_a_valid_rename() -> TestResult {
     let odb = crate::util::object_db();
     let mut tracker = Tracker::<Change>::new(Rewrites {
         copies: Some(Copies {
-            percentage: Some(1.0),
+            percentage: Some(0.95),
             ..Default::default()
         }),
         ..renames(0.5)
@@ -398,7 +398,7 @@ fn stricter_copy_threshold_does_not_crowd_out_a_valid_rename() -> TestResult {
     for (mut change, path, data) in [
         (
             Change::deletion(),
-            "deleted",
+            "z-deleted",
             format!("{}{}", "same\n".repeat(8), "other\n".repeat(2)),
         ),
         (Change::addition(), "destination", "same\n".repeat(10)),
@@ -414,9 +414,9 @@ fn stricter_copy_threshold_does_not_crowd_out_a_valid_rename() -> TestResult {
     tracker.emit(
         |destination, source| {
             if let Some(source) = source {
-                assert_eq!(source.kind, SourceKind::Rename, "only exact copies are eligible");
+                assert_eq!(source.kind, SourceKind::Rename, "only the rename is eligible");
                 assert_eq!(
-                    source.location, "deleted",
+                    source.location, "z-deleted",
                     "ineligible copies must not consume candidate slots"
                 );
                 assert_eq!(
