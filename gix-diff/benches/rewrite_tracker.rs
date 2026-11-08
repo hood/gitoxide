@@ -5,11 +5,11 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use gix_diff::{
     Rewrites,
     rewrites::{Copies, CopySource, Outcome, Tracker, tracker::ChangeKind},
-    tree::visit::{Action, ChangeId, Relation},
+    tree::visit::Action,
 };
 use gix_hash::{ObjectId, oid};
 use gix_object::{
-    Kind, Write as ObjectWrite,
+    FindExt, Kind, Tree, Write as ObjectWrite,
     tree::{EntryKind, EntryMode},
 };
 
@@ -26,7 +26,6 @@ struct Change {
     id: ObjectId,
     kind: ChangeKind,
     mode: EntryMode,
-    relation: Option<Relation>,
 }
 
 impl Change {
@@ -35,7 +34,6 @@ impl Change {
             id,
             kind,
             mode: EntryKind::Blob.into(),
-            relation: None,
         }
     }
 }
@@ -43,10 +41,6 @@ impl Change {
 impl gix_diff::rewrites::tracker::Change for Change {
     fn id(&self) -> Option<&oid> {
         (!self.id.is_null()).then_some(self.id.as_ref())
-    }
-
-    fn relation(&self) -> Option<Relation> {
-        self.relation
     }
 
     fn kind(&self) -> ChangeKind {
@@ -151,14 +145,14 @@ fn bench_exhaustive_copy_sources(c: &mut Criterion) {
 }
 
 fn bench_renamed_directories(c: &mut Criterion) {
-    let mut group = c.benchmark_group("rewrite-tracker/renamed-directories");
+    let mut group = c.benchmark_group("tree-diff/renamed-directories");
     for &count in RENAMED_DIRECTORY_COUNTS {
         let scenario = renamed_directories(count);
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &scenario, |b, scenario| {
             b.iter_batched(
                 || scenario,
-                |scenario| black_box(run_tracker(scenario)),
+                |scenario| black_box(run_directory_diff(scenario)),
                 BatchSize::SmallInput,
             );
         });
@@ -328,68 +322,92 @@ fn exhaustive_copy_sources(count: usize) -> Scenario {
     }
 }
 
-/// `count` directories that are renamed while one of their files changes, so the directories differ by id
-/// and can only be matched through the renames of their unchanged files.
-fn renamed_directories(count: usize) -> Scenario {
+struct DirectoryScenario {
+    objects: ObjectDb,
+    source_tree_id: ObjectId,
+    destination_tree_id: ObjectId,
+    count: usize,
+}
+
+/// Independent directory moves with one edited child each require inference from file renames.
+fn renamed_directories(count: usize) -> DirectoryScenario {
     let objects = object_db();
-    let mut changes = Vec::with_capacity(count * 2 * (UNCHANGED_FILES_PER_DIRECTORY + 2));
+    let mut source = gix_object::tree::Editor::new(Tree::default(), &gix_object::find::Never, gix_hash::Kind::Sha1);
+    let mut destination =
+        gix_object::tree::Editor::new(Tree::default(), &gix_object::find::Never, gix_hash::Kind::Sha1);
     for idx in 0..count {
-        let (old_dir, new_dir) = (format!("old/dir-{idx:05}"), format!("new/dir-{idx:05}"));
-        let (old_dir_id, new_dir_id) = (2 * idx as ChangeId, 2 * idx as ChangeId + 1);
-        for (dir, dir_id, kind) in [
-            (&old_dir, old_dir_id, ChangeKind::Deletion),
-            (&new_dir, new_dir_id, ChangeKind::Addition),
-        ] {
-            let tree_id = gix_object::compute_hash(gix_hash::Kind::Sha1, Kind::Tree, dir.as_bytes())
-                .expect("hashing in memory succeeds");
-            changes.push((
-                Change {
-                    mode: EntryKind::Tree.into(),
-                    relation: Some(Relation::Parent(dir_id)),
-                    ..Change::new(tree_id, kind)
-                },
-                dir.as_str().into(),
-            ));
+        let (old_dir, new_dir) = (format!("old-{idx:05}"), format!("new-{idx:05}"));
+        for file in 0..=UNCHANGED_FILES_PER_DIRECTORY {
+            let name = format!("file-{file}.txt");
+            let source_blob_id = insert_blob(&objects, &format!("file {file} in directory {idx}\n"));
+            let destination_blob_id = if file == UNCHANGED_FILES_PER_DIRECTORY {
+                insert_blob(&objects, &format!("edited file {file} in directory {idx}\n"))
+            } else {
+                source_blob_id
+            };
+            source
+                .upsert([old_dir.as_str(), name.as_str()], EntryKind::Blob, source_blob_id)
+                .expect("benchmark paths are valid");
+            destination
+                .upsert([new_dir.as_str(), name.as_str()], EntryKind::Blob, destination_blob_id)
+                .expect("benchmark paths are valid");
         }
-        let child = |blob_id, kind, dir_id| Change {
-            relation: Some(Relation::ChildOfParent(dir_id)),
-            ..Change::new(blob_id, kind)
-        };
-        for file in 0..UNCHANGED_FILES_PER_DIRECTORY {
-            let blob_id = insert_blob(&objects, &format!("unchanged file {file} in directory {idx}\n"));
-            changes.push((
-                child(blob_id, ChangeKind::Deletion, old_dir_id),
-                format!("{old_dir}/file-{file}.txt").into(),
-            ));
-            changes.push((
-                child(blob_id, ChangeKind::Addition, new_dir_id),
-                format!("{new_dir}/file-{file}.txt").into(),
-            ));
-        }
-        let before_blob_id = insert_blob(&objects, &format!("changed file in directory {idx}\n"));
-        let after_blob_id = insert_blob(&objects, &format!("changed file in directory {idx}, now edited\n"));
-        changes.push((
-            child(before_blob_id, ChangeKind::Deletion, old_dir_id),
-            format!("{old_dir}/changed.txt").into(),
-        ));
-        changes.push((
-            child(after_blob_id, ChangeKind::Addition, new_dir_id),
-            format!("{new_dir}/changed.txt").into(),
-        ));
     }
-    Scenario {
-        rewrites: Rewrites {
-            percentage: None,
-            limit: 0,
-            ..Default::default()
-        },
-        changes,
-        source_tree_changes: Vec::new(),
+    DirectoryScenario {
+        source_tree_id: source
+            .write(|tree| objects.write(tree))
+            .expect("in-memory tree writes succeed"),
+        destination_tree_id: destination
+            .write(|tree| objects.write(tree))
+            .expect("in-memory tree writes succeed"),
         objects,
-        // The unchanged files and their directory are renames; the changed file is an addition and a deletion.
-        expected_matches: count * (UNCHANGED_FILES_PER_DIRECTORY + 1),
-        expected_similarity_checks: Some(0),
+        count,
     }
+}
+
+fn run_directory_diff(scenario: &DirectoryScenario) -> Option<Outcome> {
+    let (mut source_buf, mut destination_buf) = (Vec::new(), Vec::new());
+    let (mut directories, mut files) = (0, 0);
+    let outcome = gix_diff::tree_with_rewrites(
+        scenario
+            .objects
+            .find_tree_iter(&scenario.source_tree_id, &mut source_buf)
+            .expect("source tree exists"),
+        scenario
+            .objects
+            .find_tree_iter(&scenario.destination_tree_id, &mut destination_buf)
+            .expect("destination tree exists"),
+        &mut new_diff_platform(),
+        &mut Default::default(),
+        &scenario.objects,
+        |change| {
+            if let gix_diff::tree_with_rewrites::ChangeRef::Rewrite { entry_mode, .. } = change {
+                if entry_mode.is_tree() {
+                    directories += 1;
+                } else {
+                    files += 1;
+                }
+            }
+            black_box(change);
+            Ok(Action::Continue(()))
+        },
+        gix_diff::tree_with_rewrites::Options {
+            location: Some(gix_diff::tree::recorder::Location::Path),
+            rewrites: Some(Rewrites {
+                percentage: None,
+                limit: 0,
+                ..Default::default()
+            }),
+        },
+    )
+    .expect("benchmark tree diff succeeds");
+    assert_eq!(directories, scenario.count, "each moved directory is inferred");
+    assert_eq!(
+        files,
+        scenario.count * UNCHANGED_FILES_PER_DIRECTORY,
+        "only unchanged files match exactly"
+    );
+    outcome
 }
 
 fn text_blob(idx: usize, with_edit: bool) -> String {

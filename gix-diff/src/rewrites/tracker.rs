@@ -1,8 +1,9 @@
 //! Rename and copy detection following Git's `diffcore-rename.c`.
 //!
 //! Exact matches precede a unique-basename pass and a globally ranked, four-candidates-per-destination
-//! similarity matrix. Directory relations remain an extension of this API; Git's merge-specific
-//! directory heuristics and break detection are not part of this tracker.
+//! similarity matrix. Only leaf entries participate; tree diffs infer directory renames from
+//! the resulting file matches. Git's merge-specific directory heuristics and break detection
+//! are not part of this tracker.
 
 use gix_error::{Result, message};
 use std::ops::Range;
@@ -19,7 +20,7 @@ use crate::{
         similarity::{MAX_SCORE, Signature},
         tracker::visit::SourceKind,
     },
-    tree::visit::{Action, ChangeId, Relation},
+    tree::visit::Action,
 };
 
 /// The kind of a change.
@@ -43,17 +44,6 @@ pub trait Change: Clone {
     /// Implementations should return `None` for null IDs; the tracker also guards against `Some(null)`.
     /// Modifications return the previous id, as copies originate from the source state.
     fn id(&self) -> Option<&gix_hash::oid>;
-    /// Return the relation that this change may have with other changes.
-    ///
-    /// It allows to associate a directory with its children that are added or removed at the same moment.
-    /// Note that this is ignored for modifications.
-    ///
-    /// If rename-tracking should always be on leaf-level, this should be set to `None` consistently.
-    /// Note that trees will never be looked up by their `id` as their children are assumed to be passed in
-    /// with the respective relationship.
-    ///
-    /// Also note that the tracker only sees what's given to it, it will not lookup trees or match paths itself.
-    fn relation(&self) -> Option<Relation>;
     /// Return the kind of this change.
     fn kind(&self) -> ChangeKind;
     /// Return the entry mode, using the previous mode for modifications.
@@ -78,7 +68,7 @@ impl<T: Change> Item<T> {
         use EntryKind::*;
         matches!(
             (other.kind(), self.change.entry_mode().kind()),
-            (Blob | BlobExecutable, Blob | BlobExecutable) | (Link, Link) | (Tree, Tree) | (Commit, Commit)
+            (Blob | BlobExecutable, Blob | BlobExecutable) | (Link, Link) | (Commit, Commit)
         )
     }
 }
@@ -104,7 +94,7 @@ pub mod visit {
         /// The change that was registered as source.
         pub change: &'a T,
         /// The byte-span score of an inexact match, including binary files.
-        /// `None` denotes an exact identity match or an inferred directory rename.
+        /// `None` denotes an exact identity match.
         pub similarity: Option<Similarity>,
     }
 
@@ -135,7 +125,6 @@ impl<T: Change> Tracker<T> {
             items: vec![],
             path_backing: vec![],
             rewrites,
-            child_renames: Default::default(),
         }
     }
 }
@@ -149,11 +138,7 @@ impl<T: Change> Tracker<T> {
             return Some(change);
         }
 
-        let entry_kind = change.entry_mode().kind();
-        let relation = change
-            .relation()
-            .filter(|_| matches!(change_kind, ChangeKind::Addition | ChangeKind::Deletion));
-        if let (None, EntryKind::Tree) = (relation, entry_kind) {
+        if change.entry_mode().is_tree() {
             return Some(change);
         }
 
@@ -174,8 +159,7 @@ impl<T: Change> Tracker<T> {
     /// `cb(destination, source)` is called for each item, either with `Some(source)` if it's
     /// the destination of a copy or rename, or with `None` for source if no relation to other
     /// items in the tracked set exist, which is like saying 'no rename or rewrite or copy' happened.
-    /// Directories with [relation](Relation) are matched without changing Git's file choices. Unique exact file pairs
-    /// can be emitted together with their identical directory; otherwise file renames determine the parent matches.
+    /// Tree entries are returned by [`Self::try_push_change()`] for the caller to handle.
     ///
     /// `objects` provides blob data for similarity checks. Worktree resources are converted to their Git form
     /// using the filters in `diff_cache`. Similarity uses Git's byte-span fingerprints, including for binary files;
@@ -198,7 +182,6 @@ impl<T: Change> Tracker<T> {
         PushSourceTreeFn: FnMut(&mut dyn FnMut(T, &BStr)) -> std::result::Result<(), E>,
         E: std::error::Error + Send + Sync + 'static,
     {
-        self.child_renames.clear();
         let mut out = Outcome {
             options: self.rewrites,
             ..Default::default()
@@ -242,71 +225,8 @@ impl<T: Change> Tracker<T> {
                 })?;
             }
             self.sort_items_by_id_and_location();
-            let mut cancelled =
-                self.can_match_directories_first() && self.match_identical_directories(&mut cb)?.is_break();
-            if !cancelled {
-                let mut pairs = self.find_file_renames(&mut out, diff_cache, objects)?;
-                let mut directories = Vec::new();
-                pairs.retain(|pair| {
-                    if self.items[pair.dst].change.entry_mode().is_tree() {
-                        directories.push(*pair);
-                        false
-                    } else {
-                        true
-                    }
-                });
-                cancelled = self.emit_pairs(&pairs, &mut cb)?.is_break();
-                if !cancelled && !directories.is_empty() {
-                    // File choices determine their parents before identical trees can claim another parent.
-                    self.match_renamed_directories(&mut |destination, source| {
-                        let action = cb(destination, source);
-                        cancelled |= action.is_break();
-                        action
-                    })?;
-                    if !cancelled {
-                        let mut file_parents = std::collections::HashMap::new();
-                        for &(src, dst) in self.child_renames.keys() {
-                            for (parent, other) in [(src, dst), (dst, src)] {
-                                file_parents
-                                    .entry(parent)
-                                    .and_modify(|current| {
-                                        if *current != Some(other) {
-                                            *current = None;
-                                        }
-                                    })
-                                    .or_insert(Some(other));
-                            }
-                        }
-                        directories.retain(|pair| {
-                            let (src, dst) = (&self.items[pair.src], &self.items[pair.dst]);
-                            !src.emitted
-                                && !dst.emitted
-                                && src
-                                    .change
-                                    .relation()
-                                    .zip(dst.change.relation())
-                                    .is_none_or(|(src, dst)| {
-                                        let relation_id = |relation| match relation {
-                                            Relation::Parent(id) | Relation::ChildOfParent(id) => id,
-                                        };
-                                        let (src, dst) = (relation_id(src), relation_id(dst));
-                                        // An exact tree must not contradict the parent choices of renamed files.
-                                        file_parents.get(&src).is_none_or(|other| *other == Some(dst))
-                                            && file_parents.get(&dst).is_none_or(|other| *other == Some(src))
-                                    })
-                        });
-                        cancelled = self.emit_pairs(&directories, &mut cb)?.is_break();
-                    }
-                }
-            }
-            if !cancelled {
-                self.match_renamed_directories(&mut |destination, source| {
-                    let action = cb(destination, source);
-                    cancelled |= action.is_break();
-                    action
-                })?;
-            }
-            if cancelled {
+            let pairs = self.find_file_renames(&mut out, diff_cache, objects)?;
+            if self.emit_pairs(&pairs, &mut cb).is_break() {
                 self.items.clear();
                 self.path_backing.clear();
                 return Ok(out);
@@ -337,11 +257,11 @@ impl<T: Change> Tracker<T> {
 impl<T: Change> Tracker<T> {
     /// Sort `items` primarily by their id, so identity-based lookups can be found quickly by
     /// partitioning (see `exact_source`). Same-id items are then ordered by location, change-kind,
-    /// relation and entry-mode - a total order over each item's observable identity - so that
+    /// and entry-mode - a total order over each item's matching inputs - so that
     /// matching is deterministic and independent of the order in which changes were pushed, which
     /// the parallel dirwalk and index-traversal threads leave nondeterministic
-    /// (see <https://github.com/GitoxideLabs/gitoxide/issues/1832>). Any items that still compare
-    /// equal are identical in every observable field and are thus interchangeable for matching.
+    /// (see <https://github.com/GitoxideLabs/gitoxide/issues/1832>). Items that compare equal
+    /// have the same matching inputs.
     fn sort_items_by_id_and_location(&mut self) {
         self.items.sort_by(|a, b| {
             a.change
@@ -349,7 +269,6 @@ impl<T: Change> Tracker<T> {
                 .cmp(&b.change.id())
                 .then_with(|| a.location(&self.path_backing).cmp(b.location(&self.path_backing)))
                 .then_with(|| a.change.kind().cmp(&b.change.kind()))
-                .then_with(|| a.change.relation().cmp(&b.change.relation()))
                 .then_with(|| a.change.entry_mode().cmp(&b.change.entry_mode()))
         });
     }
@@ -364,87 +283,10 @@ impl<T: Change> Tracker<T> {
 
     fn track_item(&self, item: &Item<T>) -> bool {
         self.rewrites.track_empty
-            || matches!(item.change.relation(), Some(Relation::ChildOfParent(_)))
             || item
                 .change
                 .id()
                 .is_none_or(|id| id != gix_hash::ObjectId::empty_blob(id.kind()))
-    }
-
-    fn can_match_directories_first(&self) -> bool {
-        if self.rewrites.copies.is_some() {
-            return false;
-        }
-        // Directory children can bypass Git's matching only when every exact file pair is unambiguous.
-        // Copy detection must also consider later destinations before deciding which use is a rename.
-        let mut previous_object_id = None;
-        let (mut sources, mut destinations) = (0, 0);
-        let mut has_parent = false;
-        for item in &self.items {
-            if item.change.entry_mode().is_tree() {
-                has_parent |= matches!(item.change.relation(), Some(Relation::Parent(_)));
-                continue;
-            }
-            let Some(object_id) = item.change.id().filter(|id| !id.is_null()) else {
-                return false;
-            };
-            if previous_object_id != Some(object_id) {
-                previous_object_id = Some(object_id);
-                (sources, destinations) = (0, 0);
-            }
-            match item.change.kind() {
-                ChangeKind::Deletion => sources += 1,
-                ChangeKind::Addition => destinations += 1,
-                ChangeKind::Modification => {}
-            }
-            if sources > 1 || destinations > 1 {
-                return false;
-            }
-        }
-        has_parent
-    }
-
-    fn match_identical_directories(
-        &mut self,
-        cb: &mut impl FnMut(visit::Destination<'_, T>, Option<visit::Source<'_, T>>) -> Action,
-    ) -> Result<Action> {
-        let sources: Vec<_> = self
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, item)| {
-                (item.change.kind() == ChangeKind::Deletion
-                    && matches!(item.change.relation(), Some(Relation::Parent(_))))
-                .then_some(idx)
-            })
-            .collect();
-        let mut destinations: Vec<_> = self
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, item)| {
-                (item.change.kind() == ChangeKind::Addition
-                    && matches!(item.change.relation(), Some(Relation::Parent(_))))
-                .then_some(idx)
-            })
-            .collect();
-        self.path_order(&mut destinations);
-        if sources.is_empty() || destinations.is_empty() {
-            return Ok(std::ops::ControlFlow::Continue(()));
-        }
-        let mut used: Vec<_> = self.items.iter().map(|item| item.emitted).collect();
-        for dst in destinations {
-            if self.items[dst].emitted {
-                continue;
-            }
-            if let Some(src) = self.exact_source(&sources, dst, &used, false, false) {
-                if self.emit_pair(src, dst, SourceKind::Rename, None, true, cb)?.is_break() {
-                    return Ok(std::ops::ControlFlow::Break(()));
-                }
-                used[src] = true;
-            }
-        }
-        Ok(std::ops::ControlFlow::Continue(()))
     }
 
     fn exact_source(
@@ -543,19 +385,14 @@ impl<T: Change> Tracker<T> {
             .copies
             .map_or(MAX_SCORE, |copies| minimum_score(copies.percentage));
         if rename_score < MAX_SCORE || copy_score < MAX_SCORE {
-            sources.retain(|&src| !self.items[src].change.entry_mode().is_tree());
             self.path_order(&mut sources);
             let mut signatures: Vec<_> = (0..self.items.len()).map(|_| SimilarityData::default()).collect();
             if !copies {
                 sources.retain(|&src| !used[src]);
                 // Git reserves unique basename pairs at a stricter threshold before checking the matrix limit.
                 let source_names = self.unique_basenames(sources.iter().copied());
-                let destination_names = self.unique_basenames(
-                    destinations
-                        .iter()
-                        .copied()
-                        .filter(|&dst| matches[dst].is_none() && !self.items[dst].change.entry_mode().is_tree()),
-                );
+                let destination_names =
+                    self.unique_basenames(destinations.iter().copied().filter(|&dst| matches[dst].is_none()));
                 let basename_score = rename_score + (MAX_SCORE - rename_score) / 2;
                 for &src in &sources {
                     let name = filename(self.items[src].location(&self.path_backing));
@@ -597,7 +434,7 @@ impl<T: Change> Tracker<T> {
             let destinations: Vec<_> = destinations
                 .iter()
                 .copied()
-                .filter(|&dst| matches[dst].is_none() && !self.items[dst].change.entry_mode().is_tree())
+                .filter(|&dst| matches[dst].is_none())
                 .collect();
             let mut limited =
                 self.rewrites.limit != 0 && limit_is_exceeded(sources.len(), destinations.len(), self.rewrites.limit);
@@ -740,10 +577,7 @@ impl<T: Change> Tracker<T> {
         let (Some(source_size), Some(destination_size)) = (signatures[src].size, signatures[dst].size) else {
             return Ok(None);
         };
-        if destination_size == 0
-            && !self.rewrites.track_empty
-            && !matches!(self.items[dst].change.relation(), Some(Relation::ChildOfParent(_)))
-        {
+        if destination_size == 0 && !self.rewrites.track_empty {
             return Ok(None);
         }
         let max_size = source_size.max(destination_size) as u128;
@@ -780,9 +614,9 @@ impl<T: Change> Tracker<T> {
         &mut self,
         pairs: &[Candidate],
         cb: &mut impl FnMut(visit::Destination<'_, T>, Option<visit::Source<'_, T>>) -> Action,
-    ) -> Result<Action> {
+    ) -> Action {
         if pairs.is_empty() {
-            return Ok(std::ops::ControlFlow::Continue(()));
+            return std::ops::ControlFlow::Continue(());
         }
         // Git labels the last destination of a removed source a rename, and earlier uses copies.
         let mut last_destination = vec![None; self.items.len()];
@@ -800,14 +634,9 @@ impl<T: Change> Tracker<T> {
                 SourceKind::Copy
             };
             let similarity = (!pair.exact).then_some(Similarity(pair.score));
-            if self
-                .emit_pair(pair.src, pair.dst, kind, similarity, false, cb)?
-                .is_break()
-            {
-                return Ok(std::ops::ControlFlow::Break(()));
-            }
+            self.emit_pair(pair.src, pair.dst, kind, similarity, cb)?;
         }
-        Ok(std::ops::ControlFlow::Continue(()))
+        std::ops::ControlFlow::Continue(())
     }
 
     fn emit_pair(
@@ -816,14 +645,10 @@ impl<T: Change> Tracker<T> {
         dst: usize,
         kind: SourceKind,
         similarity: Option<Similarity>,
-        match_children: bool,
         cb: &mut impl FnMut(visit::Destination<'_, T>, Option<visit::Source<'_, T>>) -> Action,
-    ) -> Result<Action> {
+    ) -> Action {
         let source = &self.items[src];
         let destination = &self.items[dst];
-        let relations = (kind == SourceKind::Rename)
-            .then(|| source.change.relation().zip(destination.change.relation()))
-            .flatten();
         let action = cb(
             visit::Destination {
                 change: destination.change.clone(),
@@ -842,196 +667,7 @@ impl<T: Change> Tracker<T> {
         if self.items[src].change.kind() == ChangeKind::Deletion {
             self.items[src].emitted = true;
         }
-        if action.is_break() {
-            return Ok(action);
-        }
-        match relations {
-            Some((Relation::Parent(src), Relation::Parent(dst))) if match_children && similarity.is_none() => {
-                return self.emit_child_renames_matching_identity(cb, kind, src, dst);
-            }
-            Some((Relation::ChildOfParent(src_parent), Relation::ChildOfParent(dst_parent))) => {
-                self.child_renames
-                    .entry((src_parent, dst_parent))
-                    .or_default()
-                    .push((src, dst));
-            }
-            _ => {}
-        }
-        Ok(action)
-    }
-
-    /// Emit the children of `src_parent_id` and `dst_parent_id` as pairs of exact matches, which are assumed
-    /// as `src` and `dst` were an exact match (so all children have to match exactly).
-    /// Note that we intentionally do not record them as their parents will be emitted, too.
-    fn emit_child_renames_matching_identity(
-        &mut self,
-        cb: &mut impl FnMut(visit::Destination<'_, T>, Option<visit::Source<'_, T>>) -> Action,
-        kind: visit::SourceKind,
-        src_parent_id: ChangeId,
-        dst_parent_id: ChangeId,
-    ) -> Result<Action> {
-        debug_assert_ne!(
-            src_parent_id, dst_parent_id,
-            "src and destination directories must be distinct"
-        );
-        let (mut src_items, mut dst_items) = (Vec::with_capacity(1), Vec::with_capacity(1));
-        for item in self.items.iter_mut().filter(|item| !item.emitted) {
-            match item.change.relation() {
-                Some(Relation::ChildOfParent(id)) if id == src_parent_id => {
-                    src_items.push((item.change.id().filter(|id| !id.is_null()).map(ToOwned::to_owned), item));
-                }
-                Some(Relation::ChildOfParent(id)) if id == dst_parent_id => {
-                    dst_items.push((item.change.id().filter(|id| !id.is_null()).map(ToOwned::to_owned), item));
-                }
-                _ => continue,
-            }
-        }
-
-        for ((src_id, src_item), (dst_id, dst_item)) in src_items.into_iter().zip(dst_items) {
-            // Since the parent items are already identical by ID, we know that the children will also match, we just
-            // double-check to still have a chance to be correct in case some of that goes wrong.
-            if src_id.is_some()
-                && src_id == dst_id
-                && filename(src_item.location(&self.path_backing)) == filename(dst_item.location(&self.path_backing))
-            {
-                let entry_mode = src_item.change.entry_mode();
-                let location = src_item.location(&self.path_backing);
-                let src = visit::Source {
-                    entry_mode,
-                    id: src_id,
-                    kind,
-                    location,
-                    change: &src_item.change,
-                    similarity: None,
-                };
-                let location = dst_item.location(&self.path_backing);
-                let change = dst_item.change.clone();
-                let dst = visit::Destination { change, location };
-                let res = cb(dst, Some(src));
-
-                src_item.emitted = true;
-                dst_item.emitted = true;
-
-                if res.is_break() {
-                    return Ok(res);
-                }
-            } else {
-                gix_trace::warn!(
-                    "Children of parents with change-id {src_parent_id} and {dst_parent_id} were not equal, even though their parents claimed to be"
-                );
-                break;
-            }
-        }
-        Ok(std::ops::ControlFlow::Continue(()))
-    }
-
-    /// Find directories with relation id that haven't been emitted yet and store them for lookup.
-    /// Then use the previously stored emitted renames with relation id to learn which directories they 'link'
-    /// and emit them, too.
-    /// Note that this works whenever top-level directories are renamed because they are always added and deleted,
-    /// and we only match those. One rewrite preserving the relative directory path is enough.
-    fn match_renamed_directories(
-        &mut self,
-        cb: &mut impl FnMut(visit::Destination<'_, T>, Option<visit::Source<'_, T>>) -> Action,
-    ) -> Result {
-        /// Per looked-up relation id, a cursor past the emitted directories and the indices of all its directories,
-        /// in item order.
-        type DirectoriesByRelationId = std::collections::HashMap<ChangeId, (usize, Vec<usize>)>;
-        fn unemitted_directory_matching_relation_id<T: Change>(
-            items: &[Item<T>],
-            directories: &mut DirectoriesByRelationId,
-            child_id: ChangeId,
-        ) -> Option<usize> {
-            let (cursor, indices) = directories.get_mut(&child_id)?;
-            while let Some(&idx) = indices.get(*cursor) {
-                if !items[idx].emitted {
-                    return Some(idx);
-                }
-                *cursor += 1;
-            }
-            None
-        }
-
-        if self.child_renames.is_empty() {
-            return Ok(());
-        }
-        // Scanning all items for each lookup would take time proportional to the number of child renames
-        // times the number of items, so index the directories once instead, but only those that are looked up.
-        // Items are only ever marked as emitted, never unmarked, so a cursor that skips emitted directories
-        // for good still finds the first unemitted one in item order, which is what a scan finds.
-        let mut directories: DirectoriesByRelationId = self
-            .child_renames
-            .keys()
-            .flat_map(|&(deleted_child_id, added_child_id)| [deleted_child_id, added_child_id])
-            .map(|id| (id, Default::default()))
-            .collect();
-        for (idx, item) in self.items.iter().enumerate() {
-            if let Some(Relation::Parent(id)) = item.change.relation()
-                && let Some((_, indices)) = directories.get_mut(&id)
-            {
-                indices.push(idx);
-            }
-        }
-        for ((deleted_child_id, added_child_id), children) in &self.child_renames {
-            let Some(src_idx) =
-                unemitted_directory_matching_relation_id(&self.items, &mut directories, *deleted_child_id)
-            else {
-                continue;
-            };
-            let Some(dst_idx) =
-                unemitted_directory_matching_relation_id(&self.items, &mut directories, *added_child_id)
-            else {
-                // This could go wrong in case there are mismatches, so be defensive here.
-                // But generally, we'd expect the destination item to exist.
-                continue;
-            };
-
-            let (src_item, dst_item) = (&self.items[src_idx], &self.items[dst_idx]);
-            if !children.iter().any(|&(src_child_idx, dst_child_idx)| {
-                let relative_directory = |child_idx: usize, parent: &Item<T>| {
-                    let child = &self.items[child_idx];
-                    child
-                        .location(&self.path_backing)
-                        .strip_prefix(parent.location(&self.path_backing).as_bytes())
-                        .and_then(|path| path.strip_prefix(b"/"))
-                        .map(|path| {
-                            if child.change.entry_mode().is_tree() {
-                                path
-                            } else {
-                                // File names may change without renaming their containing directory.
-                                &path[..path.rfind_byte(b'/').unwrap_or(0)]
-                            }
-                        })
-                };
-                let src_relative = relative_directory(src_child_idx, src_item);
-                let dst_relative = relative_directory(dst_child_idx, dst_item);
-                src_relative.is_some() && src_relative == dst_relative
-            }) {
-                continue;
-            }
-            let entry_mode = src_item.change.entry_mode();
-            let location = src_item.location(&self.path_backing);
-            let src = visit::Source {
-                entry_mode,
-                id: src_item.change.id().filter(|id| !id.is_null()).map(ToOwned::to_owned),
-                kind: SourceKind::Rename,
-                location,
-                change: &src_item.change,
-                similarity: None,
-            };
-            let location = dst_item.location(&self.path_backing);
-            let change = dst_item.change.clone();
-            let dst = visit::Destination { change, location };
-            let res = cb(dst, Some(src));
-
-            self.items[src_idx].emitted = true;
-            self.items[dst_idx].emitted = true;
-
-            if res.is_break() {
-                return Ok(());
-            }
-        }
-        Ok(())
+        action
     }
 }
 
@@ -1106,269 +742,5 @@ mod limit_is_exceeded {
             limit_is_exceeded(usize::MAX, 1, 1),
             "the product, not the smaller candidate count, determines whether the limit is exceeded"
         );
-    }
-}
-
-#[cfg(test)]
-mod match_renamed_directories {
-    use bstr::{BString, ByteSlice};
-    use gix_error::TestResult;
-    use gix_hash::ObjectId;
-    use gix_object::tree::{EntryKind, EntryMode};
-
-    use super::{Change as _, Item, visit};
-    use crate::{
-        Rewrites,
-        rewrites::Tracker,
-        tree::visit::{Action, Change, ChangeId, Relation},
-    };
-
-    /// A deterministic xorshift64* sequence, so the cases are reproducible without a dependency.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-        }
-
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n.max(1)
-        }
-    }
-
-    /// The lookup as it was before directories were indexed: a scan of all items per child rename.
-    /// The rest is the same as in [`Tracker::match_renamed_directories()`], but directory pairs whose
-    /// children don't agree on their relative directory are counted in `rejected`.
-    fn scan_all_items(
-        tracker: &mut Tracker<Change>,
-        cb: &mut impl FnMut(visit::Destination<'_, Change>, Option<visit::Source<'_, Change>>) -> Action,
-        rejected: &mut usize,
-    ) {
-        fn unemitted_directory_matching_relation_id(items: &[Item<Change>], child_id: ChangeId) -> Option<usize> {
-            items.iter().position(|i| {
-                !i.emitted && matches!(i.change.relation(), Some(Relation::Parent(pid)) if pid == child_id)
-            })
-        }
-        for ((deleted_child_id, added_child_id), children) in &tracker.child_renames {
-            let Some(src_idx) = unemitted_directory_matching_relation_id(&tracker.items, *deleted_child_id) else {
-                continue;
-            };
-            let Some(dst_idx) = unemitted_directory_matching_relation_id(&tracker.items, *added_child_id) else {
-                continue;
-            };
-
-            let (src_item, dst_item) = (&tracker.items[src_idx], &tracker.items[dst_idx]);
-            if !children.iter().any(|&(src_child_idx, dst_child_idx)| {
-                let relative_directory = |child_idx: usize, parent: &Item<Change>| {
-                    let child = &tracker.items[child_idx];
-                    child
-                        .location(&tracker.path_backing)
-                        .strip_prefix(parent.location(&tracker.path_backing).as_bytes())
-                        .and_then(|path| path.strip_prefix(b"/"))
-                        .map(|path| {
-                            if child.change.entry_mode().is_tree() {
-                                path
-                            } else {
-                                &path[..path.rfind_byte(b'/').unwrap_or(0)]
-                            }
-                        })
-                };
-                let src_relative = relative_directory(src_child_idx, src_item);
-                let dst_relative = relative_directory(dst_child_idx, dst_item);
-                src_relative.is_some() && src_relative == dst_relative
-            }) {
-                *rejected += 1;
-                continue;
-            }
-            let src = visit::Source {
-                entry_mode: src_item.change.entry_mode(),
-                id: src_item.change.id().filter(|id| !id.is_null()).map(ToOwned::to_owned),
-                kind: visit::SourceKind::Rename,
-                location: src_item.location(&tracker.path_backing),
-                change: &src_item.change,
-                similarity: None,
-            };
-            let dst = visit::Destination {
-                change: dst_item.change.clone(),
-                location: dst_item.location(&tracker.path_backing),
-            };
-            let res = cb(dst, Some(src));
-
-            tracker.items[src_idx].emitted = true;
-            tracker.items[dst_idx].emitted = true;
-
-            if res.is_break() {
-                return;
-            }
-        }
-    }
-
-    /// Path components are drawn from a small set, so that paths repeat, and children
-    /// sometimes do and sometimes don't agree on their directory relative to their parent.
-    const NAMES: &[&str] = &["a", "b"];
-
-    /// Create `num_items` items whose relations use `num_ids` ids, so several directories can share one,
-    /// with about `emitted_per_mille` of them emitted already.
-    /// Then record up to `num_pairs` child renames, with random child pairs, whose ids may also name no directory
-    /// or the same id for source and destination.
-    fn random_tracker(
-        rng: &mut Rng,
-        num_items: usize,
-        num_ids: u64,
-        num_pairs: usize,
-        emitted_per_mille: u64,
-    ) -> Tracker<Change> {
-        let mut tracker = Tracker::new(Rewrites::default());
-        for _ in 0..num_items {
-            let relation = match rng.below(3) {
-                0 => Some(Relation::Parent(rng.below(num_ids) as ChangeId)),
-                1 => Some(Relation::ChildOfParent(rng.below(num_ids) as ChangeId)),
-                _ => None,
-            };
-            let is_tree = matches!(relation, Some(Relation::Parent(_))) || rng.below(4) == 0;
-            let entry_mode: EntryMode = if is_tree { EntryKind::Tree } else { EntryKind::Blob }.into();
-            let mut oid = [0u8; 20];
-            oid[..8].copy_from_slice(&rng.next().to_be_bytes());
-            let oid = ObjectId::from_bytes_or_panic(&oid);
-            let change = if rng.below(2) == 0 {
-                Change::Addition {
-                    entry_mode,
-                    oid,
-                    relation,
-                }
-            } else {
-                Change::Deletion {
-                    entry_mode,
-                    oid,
-                    relation,
-                }
-            };
-            // Directories are top-level, so other items are below them more often.
-            let depth = if matches!(relation, Some(Relation::Parent(_))) {
-                1
-            } else {
-                [1, 2, 2, 3][rng.below(4) as usize]
-            };
-            let path = (0..depth)
-                .map(|_| NAMES[rng.below(NAMES.len() as u64) as usize])
-                .collect::<Vec<_>>()
-                .join("/");
-            let start = tracker.path_backing.len();
-            tracker.path_backing.extend_from_slice(path.as_bytes());
-            tracker.items.push(Item {
-                change,
-                path: start..tracker.path_backing.len(),
-                emitted: rng.below(1000) < emitted_per_mille,
-            });
-        }
-        let id_range = num_ids + num_ids / 4 + 1;
-        for _ in 0..num_pairs {
-            let deleted = rng.below(id_range) as ChangeId;
-            let added = if rng.below(20) == 0 {
-                deleted
-            } else {
-                rng.below(id_range) as ChangeId
-            };
-            let num_children = 1 + rng.below(6);
-            let children = tracker.child_renames.entry((deleted, added)).or_default();
-            for _ in 0..num_children {
-                children.push((
-                    rng.below(num_items as u64) as usize,
-                    rng.below(num_items as u64) as usize,
-                ));
-            }
-        }
-        tracker
-    }
-
-    fn clone_tracker(tracker: &Tracker<Change>) -> Tracker<Change> {
-        Tracker {
-            items: tracker
-                .items
-                .iter()
-                .map(|item| Item {
-                    change: item.change.clone(),
-                    path: item.path.clone(),
-                    emitted: item.emitted,
-                })
-                .collect(),
-            path_backing: tracker.path_backing.clone(),
-            rewrites: tracker.rewrites,
-            child_renames: tracker.child_renames.clone(),
-        }
-    }
-
-    type Emitted = Vec<(BString, Option<ObjectId>, EntryMode, Change, BString, Change)>;
-
-    /// Emit renamed directories with the indexed lookup if `indexed` is `true`, or by scanning all items otherwise,
-    /// and stop after `stop_after` emissions if set.
-    /// Return all emitted pairs and the amount of directory pairs rejected by the scan.
-    fn emit(tracker: &mut Tracker<Change>, indexed: bool, stop_after: Option<usize>) -> TestResult<(Emitted, usize)> {
-        let mut out = Emitted::new();
-        let mut cb = |dst: visit::Destination<'_, Change>, src: Option<visit::Source<'_, Change>>| {
-            let src = src.expect("renamed directories always have a source");
-            out.push((
-                src.location.to_owned(),
-                src.id,
-                src.entry_mode,
-                src.change.clone(),
-                dst.location.to_owned(),
-                dst.change,
-            ));
-            if stop_after.is_some_and(|n| out.len() >= n) {
-                Action::Break(())
-            } else {
-                Action::Continue(())
-            }
-        };
-        let mut rejected = 0;
-        if indexed {
-            tracker.match_renamed_directories(&mut cb)?;
-        } else {
-            scan_all_items(tracker, &mut cb, &mut rejected);
-        }
-        Ok((out, rejected))
-    }
-
-    #[test]
-    fn indexed_lookups_emit_the_same_as_scanning_all_items() -> TestResult {
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        let (mut cases_with_renames, mut rejected_pairs) = (0, 0);
-        for case in 0..3000 {
-            let num_items = 1 + rng.below(if case % 10 == 0 { 2000 } else { 60 }) as usize;
-            let num_ids = 1 + rng.below((num_items as u64 / 3).clamp(1, 40));
-            let num_pairs = rng.below(80) as usize;
-            let emitted_per_mille = [0, 100, 500, 1000][rng.below(4) as usize];
-            let tracker = random_tracker(&mut rng, num_items, num_ids, num_pairs, emitted_per_mille);
-            let stop_after = (rng.below(4) == 0).then(|| 1 + rng.below(5) as usize);
-
-            let (mut scanned, mut indexed) = (clone_tracker(&tracker), clone_tracker(&tracker));
-            let (expected, rejected) = emit(&mut scanned, false, stop_after)?;
-            let (actual, _) = emit(&mut indexed, true, stop_after)?;
-            assert_eq!(
-                actual, expected,
-                "case {case}: the same directory pairs are emitted in the same order"
-            );
-            let emitted = |t: &Tracker<Change>| t.items.iter().map(|item| item.emitted).collect::<Vec<_>>();
-            assert_eq!(
-                emitted(&indexed),
-                emitted(&scanned),
-                "case {case}: the same items are marked as emitted"
-            );
-            cases_with_renames += usize::from(!expected.is_empty());
-            rejected_pairs += rejected;
-        }
-        assert!(
-            cases_with_renames > 1000,
-            "many cases emit renamed directories, got {cases_with_renames}"
-        );
-        assert!(
-            rejected_pairs > 1000,
-            "many directory pairs are rejected by their children and stay unemitted, got {rejected_pairs}"
-        );
-        Ok(())
     }
 }
